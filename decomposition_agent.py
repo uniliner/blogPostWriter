@@ -7,6 +7,8 @@ from prompts import (
     DECOMPOSITION_PLANNING_PROMPT,
     SUBTASK_EXECUTION_PROMPT,
     SYNTHESIS_PROMPT,
+    REFLECTION_PROMPT,
+    REFINEMENT_PROMPT,
     get_planning_prompt
 )
 
@@ -183,19 +185,19 @@ class DecompositionAgent:
         print(f"\n{'='*60}")
         print("PHASE 3: SYNTHESIS - COMBINING RESULTS")
         print(f"{'='*60}\n")
-        
+
         # Format subtask results
         results_text = ""
         for i, result in enumerate(self.subtask_results):
             results_text += f"\nSUBTASK {i+1}: {result['subtask']}\n"
             results_text += f"OUTPUT:\n{result['output']}\n"
             results_text += "-" * 40 + "\n"
-        
+
         system_prompt = SYNTHESIS_PROMPT.format(
             original_task=f"Write a technical blog post about: {topic}",
             subtask_results=results_text
         )
-        
+
         response = self.client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
@@ -204,24 +206,140 @@ class DecompositionAgent:
                 {"role": "user", "content": "Synthesize all the subtask results into a final, cohesive blog post."}
             ]
         )
-        
+
         final_output = response.content[0].text
         print(f"✅ Synthesis complete!\n")
-        
+
         return final_output
-    
-    def run(self, topic: str) -> str:
+
+    def reflect_and_refine(self, content: str, topic: str, max_iterations: int = 3) -> Dict[str, Any]:
         """
-        Run the complete decomposition agent workflow
+        Phase 4: Self-reflection and refinement (Action Item 11)
+
+        This method implements a self-reflective loop where:
+        1. The agent evaluates its own output critically
+        2. Identifies potential errors and areas for improvement
+        3. Refines the content based on self-critique
+        4. Repeats until satisfied or max iterations reached
+
+        Returns:
+            Dict containing:
+            - 'final_content': The improved blog post
+            - 'reflection_history': List of all reflections and improvements
+            - 'iterations': Number of refinement cycles performed
+        """
+        print(f"\n{'='*60}")
+        print("PHASE 4: SELF-REFLECTION AND REFINEMENT")
+        print(f"{'='*60}\n")
+
+        current_content = content
+        reflection_history = []
+
+        for iteration in range(max_iterations):
+            print(f"\n--- Reflection Cycle {iteration + 1}/{max_iterations} ---\n")
+
+            # Step 1: Reflect on current content
+            print("🔍 Evaluating current output...\n")
+
+            reflection_prompt = REFLECTION_PROMPT.format(
+                original_task=f"Write a technical blog post about: {topic}",
+                content=current_content
+            )
+
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                messages=[
+                    {"role": "user", "content": reflection_prompt}
+                ]
+            )
+
+            critique = response.content[0].text
+            print(f"📝 CRITIQUE:\n{critique}\n")
+
+            # Record the reflection
+            reflection_record = {
+                "iteration": iteration + 1,
+                "critique": critique,
+                "assessment": "NEEDS_IMPROVEMENT" if "NEEDS IMPROVEMENT" in critique.upper() else "SATISFACTORY"
+            }
+
+            # Step 2: Check if satisfied
+            if "SATISFACTORY" in critique.upper():
+                print("✅ Content evaluation: SATISFACTORY")
+                print("No further refinement needed.\n")
+                reflection_record["action_taken"] = "Accepted - no changes needed"
+                reflection_history.append(reflection_record)
+                break
+
+            # Step 3: Refine the content
+            print("🔧 Refining content based on critique...\n")
+
+            refinement_prompt = REFINEMENT_PROMPT.format(
+                original_task=f"Write a technical blog post about: {topic}",
+                current_content=current_content,
+                feedback=critique
+            )
+
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=8192,
+                messages=[
+                    {"role": "user", "content": refinement_prompt}
+                ]
+            )
+
+            refined_content = response.content[0].text
+            current_content = refined_content
+
+            print(f"✅ Refinement {iteration + 1} complete!\n")
+            reflection_record["action_taken"] = "Refined based on critique"
+            reflection_history.append(reflection_record)
+
+        # If max iterations reached, note it
+        if iteration + 1 == max_iterations:
+            print(f"ℹ️  Reached maximum refinement iterations ({max_iterations})")
+            print("Content may still benefit from further refinement.\n")
+
+        print(f"{'='*60}")
+        print("SELF-REFLECTION COMPLETE")
+        print(f"{'='*60}\n")
+
+        return {
+            "final_content": current_content,
+            "reflection_history": reflection_history,
+            "iterations": len(reflection_history)
+        }
+    
+    def run(self, topic: str) -> Dict[str, Any]:
+        """
+        Run the complete decomposition agent workflow with self-reflection
+
+        Returns:
+            Dict containing:
+            - 'final_content': The improved blog post after reflection
+            - 'synthesized_content': The initial synthesized version (before reflection)
+            - 'reflection_result': Result from the reflection phase
+            - 'reflection_history': List of all reflection cycles
         """
         # Phase 1: Plan
         plan = self.create_plan(topic)
-        
+
         # Phase 2: Execute each subtask
         for i, subtask in enumerate(plan):
             self.execute_subtask(subtask, i + 1)
-        
+
         # Phase 3: Synthesize
-        final_output = self.synthesize_results(topic)
-        
-        return final_output
+        synthesized_output = self.synthesize_results(topic)
+
+        # Phase 4: Self-reflection and refinement (Action Item 11)
+        reflection_result = self.reflect_and_refine(synthesized_output, topic)
+
+        # Return comprehensive result
+        return {
+            "final_content": reflection_result["final_content"],
+            "synthesized_content": synthesized_output,
+            "reflection_result": reflection_result,
+            "reflection_history": reflection_result["reflection_history"],
+            "iterations": reflection_result["iterations"]
+        }

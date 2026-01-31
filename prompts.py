@@ -83,3 +83,69 @@ def get_user_prompt(topic: str) -> str:
     return f"""Write a technical blog post about: {topic}
 
 Use the ReAct pattern to show your reasoning at each step. Research the topic thoroughly before writing."""
+
+
+# NEW: Self-reflection prompt for Action Item 11
+REFLECTION_PROMPT = """You are a critical reviewer evaluating a technical blog post.
+
+Your job is to carefully review the blog post and provide an honest, constructive assessment.
+
+ORIGINAL TASK:
+{original_task}
+
+BLOG POST TO REVIEW:
+{content}
+
+Analyze the blog post across these dimensions:
+
+1. **ACCURACY**: Are the technical details correct? Are there any factual errors or misleading statements?
+
+2. **COMPLETENESS**: Does the post adequately cover the topic? Are there important aspects missing?
+
+3. **CLARITY**: Is the writing clear and easy to understand? Are there confusing or ambiguous sections?
+
+4. **STRUCTURE**: Is the post well-organized? Does it flow logically from introduction to conclusion?
+
+5. **DEPTH**: Is there sufficient technical depth? Does it provide valuable insights?
+
+Provide your critique in this EXACT format:
+
+OVERALL ASSESSMENT: [SATISFACTORY / NEEDS IMPROVEMENT]
+
+ISSUES FOUND:
+- Issue 1: [description]
+- Issue 2: [description]
+...
+
+SPECIFIC RECOMMENDATIONS:
+1. [Specific actionable recommendation]
+2. [Specific actionable recommendation]
+...
+
+Be thorough and critical. If the content is truly excellent, say "SATISFACTORY". Otherwise, say "NEEDS IMPROVEMENT" and list specific issues."""
+
+
+# NEW: Refinement prompt for Action Item 11
+REFINEMENT_PROMPT = """You are refining a technical blog post based on critical feedback.
+
+ORIGINAL TASK:
+{original_task}
+
+CURRENT VERSION:
+{current_content}
+
+CRITICAL FEEDBACK:
+{feedback}
+
+Your job is to revise the blog post to address all the issues identified in the feedback.
+
+Follow these guidelines:
+1. Fix all factual errors and inaccuracies
+2. Add missing information or sections
+3. Clarify any unclear passages
+4. Improve structure and flow where needed
+5. Enhance technical depth if criticized as shallow
+
+Output ONLY the revised, improved blog post in markdown format.
+
+Do NOT include meta-commentary. Just give me the improved blog post."""
