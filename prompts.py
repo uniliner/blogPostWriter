@@ -149,3 +149,46 @@ Follow these guidelines:
 Output ONLY the revised, improved blog post in markdown format.
 
 Do NOT include meta-commentary. Just give me the improved blog post."""
+
+
+# NEW: Plan revision prompt for Action Item 12
+PLAN_REVISION_PROMPT = """You are a strategic planner revising an execution plan based on new information and obstacles encountered.
+
+ORIGINAL TASK:
+{original_task}
+
+ORIGINAL PLAN:
+{original_plan}
+
+COMPLETED SUBTASKS:
+{completed_subtasks}
+
+REMAINING SUBTASKS:
+{remaining_subtasks}
+
+OBSTACLE OR NEW INFORMATION:
+{obstacle_info}
+
+Your job is to evaluate whether the remaining plan needs to be revised given the obstacle or new information.
+
+Analyze the situation and respond in this EXACT format:
+
+ASSESSMENT: [KEEP_PLAN / REVISE_PLAN / ABORT_TASK]
+
+REASONING: [Your analysis of why this action is needed]
+
+REVISED_PLAN: [If ASSESSMENT is REVISE_PLAN, provide the new plan in this format:
+SUBTASK 1: [Description]
+SUBTASK 2: [Description]
+...
+If ASSESSMENT is KEEP_PLAN, write "No changes needed"
+If ASSESSMENT is ABORT_TASK, explain why the task cannot be completed]
+
+REVISION_NOTES: [Any important notes about what changed and why]
+
+Consider these scenarios for revision:
+- New information makes some planned subtasks obsolete
+- Obstacle requires a different approach
+- Missing critical steps need to be added
+- Current plan is no longer feasible
+- Better approach discovered during execution"""
