@@ -1,5 +1,6 @@
 import anthropic
 import os
+import logging
 from typing import List, Dict, Any
 import re
 from tools import TOOLS, execute_tool
@@ -12,6 +13,10 @@ from prompts import (
     PLAN_REVISION_PROMPT,
     get_planning_prompt
 )
+from logger_config import get_agent_logger
+
+# Get module logger
+logger = get_agent_logger()
 
 
 class DecompositionAgent:
@@ -24,34 +29,130 @@ class DecompositionAgent:
         self.plan_revisions = []  # Track plan revision history
         self.original_plan = []  # Keep copy of original plan
         self.revision_count = 0
+
+    def _extract_text_from_response(self, response, context: str = "API call") -> tuple[str, bool]:
+        """
+        Safely extract text content from an Anthropic API response.
+
+        Handles multiple edge cases:
+        - Empty content array
+        - Max tokens reached (incomplete response)
+        - Error responses
+        - Non-text content blocks (e.g., tool_use blocks)
+
+        Args:
+            response: The Anthropic API response object
+            context: Description of where this was called (for logging)
+
+        Returns:
+            Tuple of (extracted_text_content, should_retry)
+        """
+        try:
+            # Check if response exists and has content attribute
+            if not hasattr(response, 'content'):
+                logger.error(f"Response object missing 'content' attribute in {context}")
+                logger.debug(f"Response type: {type(response)}, Response: {response}")
+                return "", True  # Retry on missing attribute
+
+            # Check if content is empty or None
+            if not response.content or len(response.content) == 0:
+                logger.warning(f"Response has empty content array in {context}")
+
+                # Check if this is a max_tokens scenario - retry with higher limit
+                if hasattr(response, 'stop_reason') and response.stop_reason == "max_tokens":
+                    logger.warning(f"Max tokens reached in {context} - will retry with higher limit")
+                    return "", True  # Signal to retry with higher max_tokens
+
+                return "", True  # Retry on empty content
+
+            # Look for text blocks in the content
+            text_blocks = []
+            for i, block in enumerate(response.content):
+                if hasattr(block, 'type'):
+                    if block.type == "text":
+                        text_blocks.append(block.text)
+                    elif block.type == "tool_use":
+                        # This is expected in some contexts, log for debugging
+                        logger.debug(f"Found tool_use block at index {i} in {context}")
+
+            # If we found text blocks, join them
+            if text_blocks:
+                combined_text = "\n\n".join(text_blocks)
+                return combined_text, False  # Success, no retry needed
+
+            # No text blocks found - might be tool_use only, which is valid in some contexts
+            logger.warning(f"No text blocks found in response content for {context}")
+            logger.debug(f"Content block types: {[block.type for block in response.content if hasattr(block, 'type')]}")
+
+            # Check stop_reason for more context
+            if hasattr(response, 'stop_reason'):
+                if response.stop_reason == "max_tokens":
+                    logger.warning(f"Max tokens reached in {context} - will retry with higher limit")
+                    return "", True  # Retry with higher max_tokens
+                elif response.stop_reason == "error":
+                    logger.warning(f"API returned an error in {context} - will retry")
+                    return "", True  # Retry on error
+
+            # No text blocks but not an error - return empty and don't retry
+            # (caller should handle this case)
+            return "", False
+
+        except Exception as e:
+            logger.error(f"Exception while extracting text from response in {context}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return "", True  # Retry on exception
     
     def create_plan(self, topic: str) -> List[str]:
         """
         Phase 1: Create a decomposed task plan
         """
-        print(f"\n{'='*60}")
-        print("PHASE 1: TASK DECOMPOSITION - CREATING PLAN")
-        print(f"{'='*60}\n")
+        logger.info(f"{'='*60}")
+        logger.info("PHASE 1: TASK DECOMPOSITION - CREATING PLAN")
+        logger.info(f"{'='*60}")
 
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048,
-            system=DECOMPOSITION_PLANNING_PROMPT,
-            messages=[
-                {"role": "user", "content": get_planning_prompt(topic)}
-            ]
-        )
+        max_retries = 3
+        base_max_tokens = 2048
 
-        plan_text = response.content[0].text
-        print(f"📋 GENERATED PLAN:\n{plan_text}\n")
+        for attempt in range(max_retries):
+            max_tokens = base_max_tokens * (2 ** attempt)  # Double tokens each retry
 
-        # Parse subtasks from the response
-        subtasks = self._parse_subtasks(plan_text)
-        self.full_plan = subtasks
-        self.original_plan = subtasks.copy()  # Store original for revision tracking
+            try:
+                response = self.client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=max_tokens,
+                    system=DECOMPOSITION_PLANNING_PROMPT,
+                    messages=[
+                        {"role": "user", "content": get_planning_prompt(topic)}
+                    ]
+                )
 
-        print(f"✅ Plan created with {len(subtasks)} subtasks\n")
-        return subtasks
+                plan_text, should_retry = self._extract_text_from_response(response, f"create_plan (attempt {attempt + 1})")
+
+                if plan_text:
+                    logger.debug(f"GENERATED PLAN:\n{plan_text}")
+                    # Parse subtasks from the response
+                    subtasks = self._parse_subtasks(plan_text)
+                    self.full_plan = subtasks
+                    self.original_plan = subtasks.copy()  # Store original for revision tracking
+                    logger.info(f"Plan created with {len(subtasks)} subtasks")
+                    return subtasks
+
+                if not should_retry or attempt == max_retries - 1:
+                    # Last attempt or non-retryable error
+                    break
+
+                logger.info(f"Retrying with increased max_tokens ({max_tokens * 2})...")
+
+            except Exception as e:
+                logger.error(f"Exception in create_plan (attempt {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    raise ValueError(f"Failed to create plan after {max_retries} attempts: {e}")
+                logger.info(f"Retrying...")
+
+        # If we get here, all retries failed
+        logger.error("Failed to extract plan text from API response after all retries")
+        raise ValueError("Unable to create plan: No text content in API response")
     
     def _parse_subtasks(self, plan_text: str) -> List[str]:
         """
@@ -112,9 +213,9 @@ class DecompositionAgent:
 
         Returns dict with assessment result and decision.
         """
-        print(f"\n{'='*60}")
-        print("🔄 ASSESSING PLAN REVISION NEED")
-        print(f"{'='*60}\n")
+        logger.info(f"{'='*60}")
+        logger.info("ASSESSING PLAN REVISION NEED")
+        logger.info(f"{'='*60}")
 
         # Format context for the revision prompt
         full_plan_text = "\n".join([
@@ -138,21 +239,50 @@ class DecompositionAgent:
             obstacle_info=obstacle_info
         )
 
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            messages=[
-                {"role": "user", "content": system_prompt}
-            ]
-        )
+        max_retries = 3
+        base_max_tokens = 4096
 
-        assessment_text = response.content[0].text
-        print(f"📋 REVISION ASSESSMENT:\n{assessment_text}\n")
+        for attempt in range(max_retries):
+            max_tokens = base_max_tokens * (2 ** attempt)
 
-        # Parse the assessment
-        assessment = self._parse_revision_assessment(assessment_text)
+            try:
+                response = self.client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "user", "content": system_prompt}
+                    ]
+                )
 
-        return assessment
+                assessment_text, should_retry = self._extract_text_from_response(
+                    response, f"_assess_plan_revision_needed (attempt {attempt + 1})"
+                )
+
+                if assessment_text:
+                    logger.debug(f"REVISION ASSESSMENT:\n{assessment_text}")
+                    # Parse the assessment
+                    assessment = self._parse_revision_assessment(assessment_text)
+                    return assessment
+
+                if not should_retry or attempt == max_retries - 1:
+                    break
+
+                logger.info(f"Retrying assessment with increased max_tokens ({max_tokens * 2})...")
+
+            except Exception as e:
+                logger.error(f"Exception in _assess_plan_revision_needed (attempt {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    break
+                logger.info("Retrying...")
+
+        # All retries failed - return default assessment to keep plan running
+        logger.warning("Failed to get assessment from API after retries - keeping current plan")
+        return {
+            'assessment': 'KEEP_PLAN',
+            'reasoning': 'Failed to get assessment from API - keeping current plan',
+            'revised_plan': [],
+            'revision_notes': ''
+        }
 
     def _parse_revision_assessment(self, assessment_text: str) -> Dict[str, Any]:
         """
@@ -217,18 +347,18 @@ class DecompositionAgent:
         assessment = self._assess_plan_revision_needed(obstacle_info, topic)
 
         if assessment['assessment'] == 'KEEP_PLAN':
-            print("✅ Plan revision assessment: No changes needed\n")
+            logger.info("Plan revision assessment: No changes needed")
             return False
 
         elif assessment['assessment'] == 'ABORT_TASK':
-            print("⚠️  Plan revision assessment: Task cannot be completed")
-            print(f"   Reason: {assessment['reasoning']}\n")
+            logger.warning("Plan revision assessment: Task cannot be completed")
+            logger.warning(f"Reason: {assessment['reasoning']}")
             return False
 
         elif assessment['assessment'] == 'REVISE_PLAN':
-            print(f"🔄 REVISING PLAN (Revision #{self.revision_count + 1})")
-            print(f"   Reason: {assessment['reasoning']}")
-            print(f"   Notes: {assessment['revision_notes']}\n")
+            logger.info(f"REVISING PLAN (Revision #{self.revision_count + 1})")
+            logger.info(f"Reason: {assessment['reasoning']}")
+            logger.info(f"Notes: {assessment['revision_notes']}")
 
             old_plan = self.full_plan.copy()
 
@@ -247,10 +377,10 @@ class DecompositionAgent:
             }
             self.plan_revisions.append(revision_record)
 
-            print(f"✅ Plan revised successfully!")
-            print(f"   Previous subtasks: {len(old_plan)}")
-            print(f"   New subtasks: {len(self.full_plan)}")
-            print(f"   Remaining: {len(self.full_plan) - len(self.completed_subtasks)}\n")
+            logger.info(f"Plan revised successfully!")
+            logger.info(f"Previous subtasks: {len(old_plan)}")
+            logger.info(f"New subtasks: {len(self.full_plan)}")
+            logger.info(f"Remaining: {len(self.full_plan) - len(self.completed_subtasks)}")
 
             return True
 
@@ -282,10 +412,10 @@ class DecompositionAgent:
 
         Action Item 12: Now includes obstacle detection and plan revision triggers.
         """
-        print(f"\n{'='*60}")
-        print(f"EXECUTING SUBTASK {subtask_number}/{len(self.full_plan)}")
-        print(f"{'='*60}")
-        print(f"📌 {subtask}\n")
+        logger.info(f"{'='*60}")
+        logger.info(f"EXECUTING SUBTASK {subtask_number}/{len(self.full_plan)}")
+        logger.info(f"{'='*60}")
+        logger.info(f"Subtask: {subtask}")
 
         # Format the full plan for context
         full_plan_text = "\n".join([
@@ -314,26 +444,91 @@ class DecompositionAgent:
         while iteration < max_iterations:
             iteration += 1
 
-            response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=4096,
-                system=system_prompt,
-                tools=TOOLS,
-                messages=messages
-            )
+            # API call with retry logic
+            max_retries = 3
+            base_max_tokens = 4096
+            response = None
+
+            for attempt in range(max_retries):
+                max_tokens = base_max_tokens * (2 ** attempt)
+
+                try:
+                    response = self.client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=max_tokens,
+                        system=system_prompt,
+                        tools=TOOLS,
+                        messages=messages
+                    )
+
+                    # Validate response has content
+                    if not hasattr(response, 'content') or not response.content:
+                        logger.warning(f"Response missing content or empty (attempt {attempt + 1})")
+                        if attempt < max_retries - 1:
+                            logger.info(f"Retrying with increased max_tokens ({max_tokens * 2})...")
+                            continue
+                        # Last attempt failed
+                        if hasattr(response, 'stop_reason') and response.stop_reason == "max_tokens":
+                            logger.error("Max tokens reached during subtask execution")
+                            obstacle_info = "Max tokens reached - subtask response was truncated"
+                        else:
+                            obstacle_info = "Response has no content"
+                        if topic:
+                            self.revise_plan(obstacle_info, topic)
+                        result = {
+                            "subtask": subtask,
+                            "output": "\n".join(subtask_output),
+                            "completed": False,
+                            "obstacle_detected": True
+                        }
+                        self.subtask_results.append(result)
+                        return result
+
+                    # Successfully got response with content
+                    break
+
+                except Exception as e:
+                    logger.error(f"API call failed during subtask execution (attempt {attempt + 1}): {e}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying...")
+                        continue
+                    # All retries failed
+                    obstacle_info = f"API call failed after {max_retries} attempts: {str(e)}"
+                    if topic:
+                        self.revise_plan(obstacle_info, topic)
+                    result = {
+                        "subtask": subtask,
+                        "output": "\n".join(subtask_output),
+                        "completed": False,
+                        "obstacle_detected": True
+                    }
+                    self.subtask_results.append(result)
+                    return result
+
+            if not response:
+                # Shouldn't happen, but just in case
+                logger.error("Failed to get response after all retries")
+                result = {
+                    "subtask": subtask,
+                    "output": "\n".join(subtask_output),
+                    "completed": False,
+                    "obstacle_detected": True
+                }
+                self.subtask_results.append(result)
+                return result
 
             # Process response content
             assistant_content = []
 
             for block in response.content:
                 if block.type == "text":
-                    print(f"\n💭 {block.text}\n")
+                    logger.debug(block.text)
                     subtask_output.append(block.text)
                     assistant_content.append(block)
 
                     # Check if subtask is complete
                     if "SUBTASK COMPLETE" in block.text.upper():
-                        print(f"✅ Subtask {subtask_number} completed!\n")
+                        logger.info(f"Subtask {subtask_number} completed!")
 
                         # Action Item 12: Check for obstacles before marking as complete
                         obstacle_detection = self._detect_obstacle(
@@ -341,7 +536,7 @@ class DecompositionAgent:
                         )
 
                         if obstacle_detection['obstacle_detected']:
-                            print(f"⚠️  Obstacle detected: {obstacle_detection['obstacle_type']}")
+                            logger.warning(f"Obstacle detected: {obstacle_detection['obstacle_type']}")
 
                             # Try to revise plan if topic is provided
                             if topic:
@@ -352,7 +547,7 @@ class DecompositionAgent:
 
                                 if plan_revised:
                                     # Note: Subtask is marked complete, but plan was revised
-                                    print("📝 Plan was revised based on this obstacle.\n")
+                                    logger.info("Plan was revised based on this obstacle.")
 
                         self.completed_subtasks.append(subtask)
                         result = {
@@ -365,12 +560,12 @@ class DecompositionAgent:
                         return result
 
                 elif block.type == "tool_use":
-                    print(f"🔧 TOOL: {block.name}")
-                    print(f"   Input: {block.input}")
+                    logger.debug(f"TOOL: {block.name}")
+                    logger.debug(f"Input: {block.input}")
 
                     # Execute tool
                     tool_result = execute_tool(block.name, block.input)
-                    print(f"   Result: {tool_result}\n")
+                    logger.debug(f"Result: {tool_result}")
 
                     # Track tool result for obstacle detection (Action Item 12)
                     tool_results.append(str(tool_result))
@@ -408,7 +603,7 @@ class DecompositionAgent:
                 messages.append({"role": "assistant", "content": assistant_content})
 
         # Max iterations reached - consider this an obstacle
-        print(f"⚠️  Max iterations reached for subtask {subtask_number}")
+        logger.warning(f"Max iterations reached for subtask {subtask_number}")
 
         obstacle_info = f"Max iterations reached while executing subtask: {subtask}"
 
@@ -429,9 +624,9 @@ class DecompositionAgent:
         """
         Phase 3: Synthesize all subtask results into final output
         """
-        print(f"\n{'='*60}")
-        print("PHASE 3: SYNTHESIS - COMBINING RESULTS")
-        print(f"{'='*60}\n")
+        logger.info(f"{'='*60}")
+        logger.info("PHASE 3: SYNTHESIS - COMBINING RESULTS")
+        logger.info(f"{'='*60}")
 
         # Format subtask results
         results_text = ""
@@ -445,19 +640,44 @@ class DecompositionAgent:
             subtask_results=results_text
         )
 
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=8192,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": "Synthesize all the subtask results into a final, cohesive blog post."}
-            ]
-        )
+        max_retries = 3
+        base_max_tokens = 8192
 
-        final_output = response.content[0].text
-        print(f"✅ Synthesis complete!\n")
+        for attempt in range(max_retries):
+            max_tokens = base_max_tokens * (2 ** attempt)
 
-        return final_output
+            try:
+                response = self.client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=max_tokens,
+                    system=system_prompt,
+                    messages=[
+                        {"role": "user", "content": "Synthesize all the subtask results into a final, cohesive blog post."}
+                    ]
+                )
+
+                final_output, should_retry = self._extract_text_from_response(
+                    response, f"synthesize_results (attempt {attempt + 1})"
+                )
+
+                if final_output:
+                    logger.info("Synthesis complete!")
+                    return final_output
+
+                if not should_retry or attempt == max_retries - 1:
+                    break
+
+                logger.info(f"Retrying synthesis with increased max_tokens ({max_tokens * 2})...")
+
+            except Exception as e:
+                logger.error(f"Exception in synthesize_results (attempt {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    raise ValueError(f"Failed to synthesize results after {max_retries} attempts: {e}")
+                logger.info("Retrying...")
+
+        # All retries failed
+        logger.error("Failed to extract synthesized content from API response after all retries")
+        raise ValueError("Unable to synthesize results: No text content in API response")
 
     def reflect_and_refine(self, content: str, topic: str, max_iterations: int = 3) -> Dict[str, Any]:
         """
@@ -475,34 +695,73 @@ class DecompositionAgent:
             - 'reflection_history': List of all reflections and improvements
             - 'iterations': Number of refinement cycles performed
         """
-        print(f"\n{'='*60}")
-        print("PHASE 4: SELF-REFLECTION AND REFINEMENT")
-        print(f"{'='*60}\n")
+        logger.info(f"{'='*60}")
+        logger.info("PHASE 4: SELF-REFLECTION AND REFINEMENT")
+        logger.info(f"{'='*60}")
 
         current_content = content
         reflection_history = []
 
         for iteration in range(max_iterations):
-            print(f"\n--- Reflection Cycle {iteration + 1}/{max_iterations} ---\n")
+            logger.info(f"--- Reflection Cycle {iteration + 1}/{max_iterations} ---")
 
             # Step 1: Reflect on current content
-            print("🔍 Evaluating current output...\n")
+            logger.debug("Evaluating current output...")
 
             reflection_prompt = REFLECTION_PROMPT.format(
                 original_task=f"Write a technical blog post about: {topic}",
                 content=current_content
             )
 
-            response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=4096,
-                messages=[
-                    {"role": "user", "content": reflection_prompt}
-                ]
-            )
+            # Retry logic for critique
+            max_retries = 3
+            base_max_tokens = 4096
+            critique = None
 
-            critique = response.content[0].text
-            print(f"📝 CRITIQUE:\n{critique}\n")
+            for attempt in range(max_retries):
+                max_tokens = base_max_tokens * (2 ** attempt)
+
+                try:
+                    response = self.client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=max_tokens,
+                        messages=[
+                            {"role": "user", "content": reflection_prompt}
+                        ]
+                    )
+
+                    critique_text, should_retry = self._extract_text_from_response(
+                        response, f"reflect_and_refine critique (iteration {iteration + 1}, attempt {attempt + 1})"
+                    )
+
+                    if critique_text:
+                        critique = critique_text
+                        break
+
+                    if not should_retry or attempt == max_retries - 1:
+                        break
+
+                    logger.info(f"Retrying critique with increased max_tokens ({max_tokens * 2})...")
+
+                except Exception as e:
+                    logger.error(f"Exception getting critique (attempt {attempt + 1}): {e}")
+                    if attempt == max_retries - 1:
+                        break
+                    logger.info("Retrying...")
+
+            if not critique:
+                logger.warning(f"Failed to extract critique on iteration {iteration + 1}, accepting current content")
+                # Accept the current content if we can't get a critique
+                reflection_record = {
+                    "iteration": iteration + 1,
+                    "critique": "[Could not retrieve critique - accepting current content]",
+                    "assessment": "SATISFACTORY",
+                    "action_taken": "Accepted due to API error"
+                }
+                reflection_history.append(reflection_record)
+                break
+
+            logger.debug(f"CRITIQUE:\n{critique}")
 
             # Record the reflection
             reflection_record = {
@@ -513,14 +772,14 @@ class DecompositionAgent:
 
             # Step 2: Check if satisfied
             if "SATISFACTORY" in critique.upper():
-                print("✅ Content evaluation: SATISFACTORY")
-                print("No further refinement needed.\n")
+                logger.info("Content evaluation: SATISFACTORY")
+                logger.info("No further refinement needed.")
                 reflection_record["action_taken"] = "Accepted - no changes needed"
                 reflection_history.append(reflection_record)
                 break
 
             # Step 3: Refine the content
-            print("🔧 Refining content based on critique...\n")
+            logger.debug("Refining content based on critique...")
 
             refinement_prompt = REFINEMENT_PROMPT.format(
                 original_task=f"Write a technical blog post about: {topic}",
@@ -528,29 +787,63 @@ class DecompositionAgent:
                 feedback=critique
             )
 
-            response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=8192,
-                messages=[
-                    {"role": "user", "content": refinement_prompt}
-                ]
-            )
+            # Retry logic for refinement
+            max_retries = 3
+            base_max_tokens = 8192
+            refined_content = None
 
-            refined_content = response.content[0].text
+            for attempt in range(max_retries):
+                max_tokens = base_max_tokens * (2 ** attempt)
+
+                try:
+                    response = self.client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=max_tokens,
+                        messages=[
+                            {"role": "user", "content": refinement_prompt}
+                        ]
+                    )
+
+                    refined_text, should_retry = self._extract_text_from_response(
+                        response, f"refine_content (iteration {iteration + 1}, attempt {attempt + 1})"
+                    )
+
+                    if refined_text:
+                        refined_content = refined_text
+                        break
+
+                    if not should_retry or attempt == max_retries - 1:
+                        break
+
+                    logger.info(f"Retrying refinement with increased max_tokens ({max_tokens * 2})...")
+
+                except Exception as e:
+                    logger.error(f"Exception getting refinement (attempt {attempt + 1}): {e}")
+                    if attempt == max_retries - 1:
+                        break
+                    logger.info("Retrying...")
+
+            if not refined_content:
+                logger.warning(f"Failed to extract refined content on iteration {iteration + 1}, keeping current content")
+                # Keep current content if refinement fails
+                reflection_record["action_taken"] = "Kept current content due to API error"
+                reflection_history.append(reflection_record)
+                continue
+
             current_content = refined_content
 
-            print(f"✅ Refinement {iteration + 1} complete!\n")
+            logger.info(f"Refinement {iteration + 1} complete!")
             reflection_record["action_taken"] = "Refined based on critique"
             reflection_history.append(reflection_record)
 
         # If max iterations reached, note it
         if iteration + 1 == max_iterations:
-            print(f"ℹ️  Reached maximum refinement iterations ({max_iterations})")
-            print("Content may still benefit from further refinement.\n")
+            logger.info(f"Reached maximum refinement iterations ({max_iterations})")
+            logger.info("Content may still benefit from further refinement.")
 
-        print(f"{'='*60}")
-        print("SELF-REFLECTION COMPLETE")
-        print(f"{'='*60}\n")
+        logger.info(f"{'='*60}")
+        logger.info("SELF-REFLECTION COMPLETE")
+        logger.info(f"{'='*60}")
 
         return {
             "final_content": current_content,
@@ -587,8 +880,8 @@ class DecompositionAgent:
 
             # Check if plan was revised during execution
             if len(self.full_plan) != len(plan):
-                print(f"📝 Plan was revised during execution!")
-                print(f"   New total subtasks: {len(self.full_plan)}\n")
+                logger.info(f"Plan was revised during execution!")
+                logger.info(f"New total subtasks: {len(self.full_plan)}")
 
             subtask_index += 1
 

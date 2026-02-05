@@ -49,7 +49,16 @@ YOUR CURRENT SUBTASK:
 {current_subtask}
 
 Execute ONLY this subtask using the ReAct pattern (Thought → Action → Observation).
-Use available tools as needed. When this specific subtask is complete, clearly state "SUBTASK COMPLETE" and summarize what you accomplished.
+Use available tools as needed:
+
+- web_search: Use when you need to gather information for your subtask
+- save_draft: ONLY use this when your subtask explicitly involves saving content.
+  You MUST provide the actual content as a string. Do NOT call save_draft for
+  review, analysis, or planning subtasks - only use it when you have written
+  content that needs to be saved.
+
+When this specific subtask is complete, clearly state "SUBTASK COMPLETE" and
+summarize what you accomplished.
 
 Stay focused on this subtask - don't try to do work from other subtasks."""
 
