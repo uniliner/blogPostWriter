@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "Blog Post Writer": "./langgraph_agent.py:graph"
+  },
+  "env": ".env"
+}

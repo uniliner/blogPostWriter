@@ -262,3 +262,8 @@ def run_blog_writer(topic: str) -> BlogWriterState:
     logger.info("=" * 60)
 
     return final_state
+
+
+# Create and export the graph for LangGraph Studio
+# This graph object is imported by LangGraph Studio via langgraph.json
+graph = create_blog_writer_graph()
